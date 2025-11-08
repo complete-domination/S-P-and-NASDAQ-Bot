@@ -18,15 +18,15 @@ if not TOKEN:
 GUILD_ID: Optional[int] = None
 if GUILD_ID_RAW:
     try:
-        GUILD_ID = int(GUILD_ID_RAW)
+        GUILD_ID = int(GUILD_ID_RAW.strip())
     except ValueError:
         raise SystemExit("GUILD_ID must be an integer if provided")
 
 # Symbols (Yahoo Finance)
 # S&P 500 = ^GSPC, NASDAQ Composite = ^IXIC
 INDEX_SYMBOLS = {
-    "S&P 500": "^GSPC",
     "NASDAQ": "^IXIC",
+    "S&P 500": "^GSPC",
 }
 
 # ---------- Logging ----------
@@ -36,7 +36,7 @@ log = logging.getLogger("index-price-bot")
 # ---------- Discord client ----------
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # enable Server Members Intent in the Dev Portal
+intents.members = True  # make sure "Server Members Intent" is enabled in the Dev Portal
 client = discord.Client(intents=intents)
 
 _http_session: Optional[aiohttp.ClientSession] = None
@@ -44,10 +44,7 @@ update_task: Optional[asyncio.Task] = None
 
 
 async def fetch_index_quotes(session: aiohttp.ClientSession) -> Dict[str, Dict]:
-    """
-    Fetch quotes for both indices in one Yahoo Finance call.
-    Returns mapping: {symbol: {"price": float, "change_pct": float}}
-    """
+    """Fetch quotes for both indices (price + 1D change %) from Yahoo in one call."""
     symbols_csv = ",".join(quote_plus(sym) for sym in INDEX_SYMBOLS.values())
     url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_csv}"
 
@@ -83,18 +80,36 @@ async def fetch_index_quotes(session: aiohttp.ClientSession) -> Dict[str, Dict]:
     raise RuntimeError("Failed to fetch index quotes after retries")
 
 
+async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
+    """Robustly get the bot's Member object in a guild."""
+    me = getattr(guild, "me", None)
+    if isinstance(me, discord.Member):
+        return me
+    m = guild.get_member(client.user.id)
+    if isinstance(m, discord.Member):
+        return m
+    try:
+        # requires Server Members Intent enabled in Dev Portal (we set intents.members=True)
+        return await guild.fetch_member(client.user.id)
+    except discord.HTTPException as e:
+        log.warning(f"[{guild.name}] fetch_member failed: {e}")
+        return None
+
+
 async def update_guild(guild: discord.Guild, which: str, quotes: Dict[str, Dict]):
     """Update nickname/presence for a single guild to show one index."""
-    try:
-        me = guild.me or await guild.fetch_member(client.user.id)
-    except discord.HTTPException as e:
-        log.warning(f"[{guild.name}] Could not fetch bot member: {e}")
+    me = await get_self_member(guild)
+    if not me:
+        log.info(f"[{guild.name}] Could not obtain bot Member; skipping.")
         return
 
     perms = me.guild_permissions
     if not (perms.change_nickname or perms.manage_nicknames):
-        log.info(f"[{guild.name}] Missing permission: Change Nickname (or Manage Nicknames).")
-        return
+        log.info(f"[{guild.name}] Missing permission: Change Nickname (or Manage Nicknames). "
+                 f"Will still set presence.")
+        can_edit_nick = False
+    else:
+        can_edit_nick = True
 
     idx_name = which  # "NASDAQ" or "S&P 500"
     symbol = INDEX_SYMBOLS[idx_name]
@@ -112,14 +127,16 @@ async def update_guild(guild: discord.Guild, which: str, quotes: Dict[str, Dict]
     if len(nickname) > 32:
         nickname = nickname[:32]
 
-    try:
-        await me.edit(nick=nickname, reason=f"Auto {idx_name} price update")
-    except discord.Forbidden:
-        log.info(f"[{guild.name}] Forbidden: role hierarchy/permissions block nickname change.")
-    except discord.HTTPException as e:
-        log.warning(f"[{guild.name}] HTTP error updating nick: {e}")
+    # Try to edit nickname (only if we have perms)
+    if can_edit_nick:
+        try:
+            await me.edit(nick=nickname, reason=f"Auto {idx_name} price update")
+        except discord.Forbidden:
+            log.info(f"[{guild.name}] Forbidden by role hierarchy; cannot change nickname.")
+        except discord.HTTPException as e:
+            log.warning(f"[{guild.name}] HTTP error updating nick: {e}")
 
-    # Presence underneath name: "NASDAQ 1D +X.XX%" or "S&P 500 1D -X.XX%"
+    # Always set presence so you see *something* even if nickname fails
     try:
         await client.change_presence(
             activity=discord.Game(name=f"{idx_name} 1D {change_pct:+.2f}%")
@@ -127,22 +144,22 @@ async def update_guild(guild: discord.Guild, which: str, quotes: Dict[str, Dict]
     except Exception as e:
         log.debug(f"[{guild.name}] Could not set presence: {e}")
 
-    log.info(f"[{guild.name}] {idx_name} → Nick: {nickname} | 1D {change_pct:+.2f}%")
+    log.info(f"[{guild.name}] {idx_name} → Nick: {nickname if can_edit_nick else '(unchanged)'} "
+             f"| 1D {change_pct:+.2f}%")
 
 
 async def updater_loop():
     await client.wait_until_ready()
-    log.info("Updater loop started.")
+    log.info(f"Updater loop started. Target guilds: "
+             f"{'all joined guilds' if not GUILD_ID else GUILD_ID}")
 
     show_nasdaq = True  # toggle state
 
     while not client.is_closed():
         try:
-            # Choose which index to display this cycle
             which = "NASDAQ" if show_nasdaq else "S&P 500"
-            show_nasdaq = not show_nasdaq  # flip for next time
+            show_nasdaq = not show_nasdaq
 
-            # Fetch both quotes once
             assert _http_session is not None, "HTTP session not initialized"
             quotes = await fetch_index_quotes(_http_session)
 
@@ -170,10 +187,8 @@ async def updater_loop():
 async def on_ready():
     global update_task, _http_session
     log.info(f"Logged in as {client.user} in {len(client.guilds)} guild(s).")
-
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
-
     if update_task is None or update_task.done():
         update_task = asyncio.create_task(updater_loop())
 
