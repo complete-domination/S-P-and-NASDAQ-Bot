@@ -23,12 +23,12 @@ if GUILD_ID_RAW:
     else:
         print("Warning: GUILD_ID is not a pure integer; ignoring and updating all guilds.")
 
-# NASDAQ Composite on Stooq
-STOOQ_SYMBOL = "^ndq"
+# Yahoo Finance symbol for E-mini NASDAQ-100 futures
+Y_SYMBOL = "NQ=F"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("nasdaq-price-bot")
+log = logging.getLogger("nasdaq-futures-bot")
 
 # ---------- Discord client ----------
 intents = discord.Intents.default()
@@ -40,61 +40,72 @@ _http_session: Optional[aiohttp.ClientSession] = None
 update_task: Optional[asyncio.Task] = None
 
 
-# ---------- Data fetch ----------
-async def fetch_nasdaq_close_and_change(session: aiohttp.ClientSession) -> Tuple[float, float]:
+# ---------- Data fetch (Yahoo Finance) ----------
+YAHOO_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+async def fetch_nq_futures(session: aiohttp.ClientSession) -> Tuple[float, float]:
     """
-    Fetch daily CSV from Stooq and compute 1D % change from the last two closes.
-    Returns (last_close_price, change_pct).
+    Fetch price and 1D % change for NQ=F (E-mini NASDAQ-100 futures) from Yahoo Finance.
+    Returns (price, change_pct). Raises on persistent failure.
     """
-    # Example: https://stooq.com/q/d/l/?s=%5Endq&i=d
-    url = f"https://stooq.com/q/d/l/?s={quote_plus(STOOQ_SYMBOL)}&i=d"
-    timeout = aiohttp.ClientTimeout(total=10)
+    symbols_csv = quote_plus(Y_SYMBOL)
+    urls = [
+        f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_csv}",
+        f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbols_csv}",
+    ]
+    backoffs = [0, 1.5, 3.0, 5.0]
 
-    for attempt in range(1, 5):
-        try:
-            async with session.get(
-                url,
-                timeout=timeout,
-                headers={"User-Agent": "Mozilla/5.0"}
-            ) as resp:
-                if resp.status != 200:
-                    txt = ""
-                    try:
-                        txt = (await resp.text())[:200]
-                    except Exception:
-                        pass
-                    log.warning(f"Stooq HTTP {resp.status} (attempt {attempt}) body={txt!r}")
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
+    last_err = "unknown error"
+    for url in urls:
+        for attempt, delay in enumerate(backoffs, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with session.get(url, headers=YAHOO_HEADERS, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        # log short body to help debug if needed
+                        body = ""
+                        try:
+                            body = (await resp.text())[:200]
+                        except Exception:
+                            pass
+                        log.warning(f"Yahoo {url} HTTP {resp.status} (attempt {attempt}) body={body!r}")
+                        last_err = f"HTTP {resp.status}"
+                        continue
 
-                text = await resp.text()
-                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-                if len(lines) < 3:
-                    # header + at least 2 data rows
-                    log.warning(f"Stooq CSV too short (attempt {attempt}): {text[:200]!r}")
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
+                    payload = await resp.json()
+                    results = payload.get("quoteResponse", {}).get("result", [])
+                    if not results:
+                        last_err = "no results"
+                        log.warning(f"Yahoo returned no results (attempt {attempt}); head={str(payload)[:200]}")
+                        continue
 
-                # CSV format: Date,Open,High,Low,Close,Volume
-                last = lines[-1].split(",")
-                prev = lines[-2].split(",")
-                if len(last) < 5 or len(prev) < 5:
-                    log.warning(f"Stooq CSV missing fields (attempt {attempt}) last={last!r} prev={prev!r}")
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
+                    row = results[0]
+                    price = row.get("regularMarketPrice")
+                    change_pct = row.get("regularMarketChangePercent")
+                    if price is None or change_pct is None:
+                        last_err = "missing fields"
+                        log.warning(f"Missing fields in Yahoo row: {row}")
+                        continue
 
-                last_close = float(last[4])
-                prev_close = float(prev[4])
-                change_pct = ((last_close - prev_close) / prev_close) * 100.0
-                return last_close, change_pct
+                    log.info("Fetched NQ=F from Yahoo successfully.")
+                    return float(price), float(change_pct)
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.warning(f"Stooq fetch error (attempt {attempt}): {e}")
-            await asyncio.sleep(1.5 * attempt)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                log.warning(f"Yahoo error (attempt {attempt}): {e}")
 
-    raise RuntimeError("Failed to fetch NASDAQ data after retries")
+    raise RuntimeError(f"Failed to fetch NQ=F: {last_err}")
 
 
+# ---------- Discord helpers ----------
 async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
     """Robustly get the bot's Member object in a guild."""
     me = getattr(guild, "me", None)
@@ -111,7 +122,7 @@ async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
 
 
 async def update_guild(guild: discord.Guild):
-    """Update nickname/presence for a single guild to show NASDAQ."""
+    """Update nickname/presence for a single guild to show NASDAQ futures."""
     me = await get_self_member(guild)
     if not me:
         log.info(f"[{guild.name}] Could not obtain bot Member; skipping.")
@@ -120,7 +131,18 @@ async def update_guild(guild: discord.Guild):
     perms = me.guild_permissions
     can_edit_nick = perms.change_nickname or perms.manage_nicknames
 
-    price, change_pct = await fetch_nasdaq_close_and_change(_http_session)
+    try:
+        assert _http_session is not None, "HTTP session not initialized"
+        price, change_pct = await fetch_nq_futures(_http_session)
+    except Exception as e:
+        log.error(f"[{guild.name}] Quote fetch failed: {e}")
+        # Show something so you know the loop is alive
+        try:
+            await client.change_presence(activity=discord.Game(name="NASDAQ Futures: error"))
+        except Exception:
+            pass
+        return
+
     emoji = "🟢" if change_pct >= 0 else "🔴"
 
     # Nickname: "$price 🟢/🔴" (no % in name), with thousand separators
@@ -130,7 +152,7 @@ async def update_guild(guild: discord.Guild):
 
     if can_edit_nick:
         try:
-            await me.edit(nick=nickname, reason="Auto NASDAQ price update (Stooq)")
+            await me.edit(nick=nickname, reason="Auto NASDAQ futures price update (Yahoo)")
         except discord.Forbidden:
             log.info(f"[{guild.name}] Forbidden by role hierarchy; cannot change nickname.")
         except discord.HTTPException as e:
@@ -138,13 +160,14 @@ async def update_guild(guild: discord.Guild):
     else:
         log.info(f"[{guild.name}] Missing permission: Change Nickname/Manage Nicknames.")
 
-    # Presence underneath name: "NASDAQ 1D +X.XX%"
+    # Presence underneath name: "NASDAQ Futures 1D +X.XX%"
     try:
-        await client.change_presence(activity=discord.Game(name=f"NASDAQ 1D {change_pct:+.2f}%"))
+        await client.change_presence(activity=discord.Game(name=f"NASDAQ Futures 1D {change_pct:+.2f}%"))
     except Exception as e:
         log.debug(f"[{guild.name}] Could not set presence: {e}")
 
-    log.info(f"[{guild.name}] NASDAQ → Nick: {nickname if can_edit_nick else '(unchanged)'} | 1D {change_pct:+.2f}%")
+    log.info(f"[{guild.name}] NASDAQ Futures → Nick: {nickname if can_edit_nick else '(unchanged)'} "
+             f"| 1D {change_pct:+.2f}%")
 
 
 # ---------- Loop ----------
