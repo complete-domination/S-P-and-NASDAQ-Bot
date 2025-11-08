@@ -8,11 +8,10 @@ import aiohttp
 import discord
 from urllib.parse import quote_plus
 
-# ---------- Config ----------
+# ======= Config =======
 TOKEN = os.environ.get("TOKEN")
-GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, update all guilds
-# Slow the cadence to avoid 429s; you can tweak this in Railway
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "180"))
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, updates all guilds
+INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "120"))  # update cadence (sec)
 
 if not TOKEN:
     raise SystemExit("Missing env var TOKEN")
@@ -25,14 +24,16 @@ if GUILD_ID_RAW:
     else:
         print("Warning: GUILD_ID is not a pure integer; ignoring and updating all guilds.")
 
-Y_SYMBOL = "NQ=F"   # Yahoo: E-mini NASDAQ-100 futures
-STOOQ_FUT = "nq.f"  # Stooq: NASDAQ-100 futures (daily CSV)
+# Yahoo Finance symbol for E-mini NASDAQ-100 futures
+Y_SYMBOL = "NQ=F"
+# Stooq symbol for NASDAQ-100 futures (daily CSV)
+STOOQ_FUT = "nq.f"
 
-# ---------- Logging ----------
+# ======= Logging =======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("nasdaq-futures-bot")
 
-# ---------- Discord client ----------
+# ======= Discord client =======
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True  # enable "Server Members Intent" in Dev Portal
@@ -41,7 +42,7 @@ client = discord.Client(intents=intents)
 _http_session: Optional[aiohttp.ClientSession] = None
 update_task: Optional[asyncio.Task] = None
 
-# ---------- Yahoo helpers ----------
+# ======= HTTP helpers =======
 Y_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
@@ -56,6 +57,7 @@ def _last_non_null(vals: List[Optional[float]]) -> Optional[float]:
     return None
 
 async def yahoo_quote(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
+    """Fast path: Yahoo 'quote' returns (price, change_pct) or None."""
     sym = quote_plus(Y_SYMBOL)
     urls = [
         f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={sym}",
@@ -91,6 +93,7 @@ async def yahoo_quote(session: aiohttp.ClientSession) -> Optional[Tuple[float, f
     return None
 
 async def yahoo_chart(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
+    """Fallback: Yahoo 'chart' returns (last_price, change_pct) or None."""
     sym = quote_plus(Y_SYMBOL)
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1m",
@@ -127,10 +130,10 @@ async def yahoo_chart(session: aiohttp.ClientSession) -> Optional[Tuple[float, f
             log.warning(f"[chart] error: {e}")
     return None
 
-# ---------- Stooq fallback (daily CSV) ----------
 async def stooq_fut_last_and_change(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
     """
-    Pull the daily CSV for nq.f and compute 1D % change from the last two closes.
+    Stooq fallback: compute 1D % from last two daily closes for nq.f.
+    CSV columns: Date,Open,High,Low,Close,Volume
     """
     url = f"https://stooq.com/q/d/l/?s={quote_plus(STOOQ_FUT)}&i=d"
     try:
@@ -152,8 +155,7 @@ async def stooq_fut_last_and_change(session: aiohttp.ClientSession) -> Optional[
             if len(last) < 5 or len(prev) < 5:
                 log.warning(f"[stooq] CSV missing fields last={last!r} prev={prev!r}")
                 return None
-            last_close = float(last[4])
-            prev_close = float(prev[4])
+            last_close = float(last[4]); prev_close = float(prev[4])
             chg = ((last_close - prev_close) / prev_close) * 100.0
             log.info("[stooq] OK")
             return last_close, chg
@@ -162,11 +164,8 @@ async def stooq_fut_last_and_change(session: aiohttp.ClientSession) -> Optional[
         return None
 
 async def fetch_price_change(session: aiohttp.ClientSession) -> Tuple[float, float, str]:
-    """
-    Try Yahoo quote -> Yahoo chart -> Stooq fallback.
-    Returns (price, change_pct, source).
-    """
-    # jitter between cycles so multiple bots don't sync-hammer Yahoo
+    """Try Yahoo quote -> Yahoo chart -> Stooq. Return (price, change_pct, source)."""
+    # tiny jitter so multiple deployments don't sync-hammer sources
     await asyncio.sleep(random.uniform(0.0, 0.8))
 
     q = await yahoo_quote(session)
@@ -183,7 +182,7 @@ async def fetch_price_change(session: aiohttp.ClientSession) -> Tuple[float, flo
 
     raise RuntimeError("All sources failed (quote, chart, stooq)")
 
-# ---------- Discord helpers ----------
+# ======= Discord helpers =======
 async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
     me = getattr(guild, "me", None)
     if isinstance(me, discord.Member):
@@ -240,7 +239,7 @@ async def update_guild(guild: discord.Guild):
     log.info(f"[{guild.name}] NASDAQ Futures [{source}] → Nick: {nickname if can_edit_nick else '(unchanged)'} "
              f"| 1D {change_pct:+.2f}%")
 
-# ---------- Loop ----------
+# ======= Loop =======
 async def updater_loop():
     await client.wait_until_ready()
     log.info(f"Updater loop started. Target: {'all guilds' if not GUILD_ID else GUILD_ID}")
@@ -267,9 +266,8 @@ async def updater_loop():
         except Exception as e:
             log.error(f"Updater loop error: {e}")
 
-        # add a small random jitter to spread requests
-        sleep_for = INTERVAL_SECONDS + random.uniform(0.0, 2.0)
-        await asyncio.sleep(sleep_for)
+        # add slight jitter to reduce synchronized requests
+        await asyncio.sleep(INTERVAL_SECONDS + random.uniform(0.0, 2.0))
 
 @client.event
 async def on_ready():
