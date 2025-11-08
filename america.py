@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from typing import Optional, Tuple, List
 
 import aiohttp
@@ -10,7 +11,8 @@ from urllib.parse import quote_plus
 # ---------- Config ----------
 TOKEN = os.environ.get("TOKEN")
 GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, update all guilds
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "60"))  # update cadence (sec)
+# Slow the cadence to avoid 429s; you can tweak this in Railway
+INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "180"))
 
 if not TOKEN:
     raise SystemExit("Missing env var TOKEN")
@@ -23,8 +25,8 @@ if GUILD_ID_RAW:
     else:
         print("Warning: GUILD_ID is not a pure integer; ignoring and updating all guilds.")
 
-# Yahoo Finance symbol for E-mini NASDAQ-100 futures
-Y_SYMBOL = "NQ=F"
+Y_SYMBOL = "NQ=F"   # Yahoo: E-mini NASDAQ-100 futures
+STOOQ_FUT = "nq.f"  # Stooq: NASDAQ-100 futures (daily CSV)
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,7 +35,7 @@ log = logging.getLogger("nasdaq-futures-bot")
 # ---------- Discord client ----------
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # enable "Server Members Intent" in the Dev Portal
+intents.members = True  # enable "Server Members Intent" in Dev Portal
 client = discord.Client(intents=intents)
 
 _http_session: Optional[aiohttp.ClientSession] = None
@@ -42,16 +44,18 @@ update_task: Optional[asyncio.Task] = None
 # ---------- Yahoo helpers ----------
 Y_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Connection": "keep-alive",
 }
 
-async def _yahoo_quote(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
-    """
-    Fast path: Yahoo 'quote' for NQ=F.
-    Returns (price, change_pct) or None if unavailable.
-    """
+def _last_non_null(vals: List[Optional[float]]) -> Optional[float]:
+    for v in reversed(vals):
+        if v is not None:
+            return float(v)
+    return None
+
+async def yahoo_quote(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
     sym = quote_plus(Y_SYMBOL)
     urls = [
         f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={sym}",
@@ -60,43 +64,33 @@ async def _yahoo_quote(session: aiohttp.ClientSession) -> Optional[Tuple[float, 
     for url in urls:
         try:
             async with session.get(url, headers=Y_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    log.warning("[quote] 429 Too Many Requests")
+                    return None
                 if resp.status != 200:
                     body = ""
-                    try:
-                        body = (await resp.text())[:200]
-                    except Exception:
-                        pass
+                    try: body = (await resp.text())[:200]
+                    except Exception: pass
                     log.warning(f"[quote] HTTP {resp.status} url={url} body={body!r}")
                     continue
                 payload = await resp.json()
                 results = payload.get("quoteResponse", {}).get("result", [])
                 if not results:
-                    log.warning("[quote] No results payload head=%r", str(payload)[:200])
+                    log.warning("[quote] No results")
                     continue
                 row = results[0]
-                # Use regularMarketPrice / regularMarketChangePercent if present
-                price = row.get("regularMarketPrice")
-                change_pct = row.get("regularMarketChangePercent")
-                if price is not None and change_pct is not None:
-                    log.info("[quote] OK from %s", url.split("//", 1)[-1].split("/", 1)[0])
-                    return float(price), float(change_pct)
-                else:
-                    log.warning("[quote] Missing fields: price=%r change_pct=%r", price, change_pct)
+                p = row.get("regularMarketPrice")
+                chg = row.get("regularMarketChangePercent")
+                if p is None or chg is None:
+                    log.warning("[quote] Missing price/change fields")
+                    continue
+                log.info("[quote] OK")
+                return float(p), float(chg)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"[quote] error: {e}")
     return None
 
-def _last_non_null(vals: List[Optional[float]]) -> Optional[float]:
-    for v in reversed(vals):
-        if v is not None:
-            return float(v)
-    return None
-
-async def _yahoo_chart(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
-    """
-    Fallback: Yahoo 'chart' for NQ=F. Compute price + 1D % from last close vs previous close.
-    Returns (price, change_pct) or None.
-    """
+async def yahoo_chart(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
     sym = quote_plus(Y_SYMBOL)
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1m",
@@ -105,50 +99,92 @@ async def _yahoo_chart(session: aiohttp.ClientSession) -> Optional[Tuple[float, 
     for url in urls:
         try:
             async with session.get(url, headers=Y_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    log.warning("[chart] 429 Too Many Requests")
+                    return None
                 if resp.status != 200:
                     body = ""
-                    try:
-                        body = (await resp.text())[:200]
-                    except Exception:
-                        pass
+                    try: body = (await resp.text())[:200]
+                    except Exception: pass
                     log.warning(f"[chart] HTTP {resp.status} url={url} body={body!r}")
                     continue
                 payload = await resp.json()
                 result = (payload.get("chart", {}) or {}).get("result", [])
                 if not result:
-                    log.warning("[chart] No result payload head=%r", str(payload)[:200])
+                    log.warning("[chart] No result")
                     continue
                 meta = result[0].get("meta", {}) or {}
-                indicators = result[0].get("indicators", {}) or {}
-                closes = (indicators.get("quote", [{}])[0].get("close") or [])
+                closes = (result[0].get("indicators", {}) or {}).get("quote", [{}])[0].get("close") or []
                 last = _last_non_null(closes)
                 prev_close = meta.get("previousClose")
                 if last is None or prev_close is None:
-                    log.warning("[chart] Missing last/previousClose last=%r prev=%r", last, prev_close)
+                    log.warning("[chart] Missing last or previousClose")
                     continue
-                change_pct = ((last - float(prev_close)) / float(prev_close)) * 100.0
-                log.info("[chart] OK from %s", url.split("//", 1)[-1].split("/", 1)[0])
-                return float(last), float(change_pct)
+                chg = ((float(last) - float(prev_close)) / float(prev_close)) * 100.0
+                log.info("[chart] OK")
+                return float(last), float(chg)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"[chart] error: {e}")
     return None
 
-async def fetch_nq_price_change(session: aiohttp.ClientSession) -> Tuple[float, float]:
+# ---------- Stooq fallback (daily CSV) ----------
+async def stooq_fut_last_and_change(session: aiohttp.ClientSession) -> Optional[Tuple[float, float]]:
     """
-    Unified fetcher: try quote first, then chart fallback.
-    Raises RuntimeError if both fail.
+    Pull the daily CSV for nq.f and compute 1D % change from the last two closes.
     """
-    q = await _yahoo_quote(session)
+    url = f"https://stooq.com/q/d/l/?s={quote_plus(STOOQ_FUT)}&i=d"
+    try:
+        async with session.get(url, headers={"User-Agent": Y_HEADERS["User-Agent"]},
+                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                body = ""
+                try: body = (await resp.text())[:200]
+                except Exception: pass
+                log.warning(f"[stooq] HTTP {resp.status} body={body!r}")
+                return None
+            text = await resp.text()
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) < 3:
+                log.warning("[stooq] CSV too short")
+                return None
+            last = lines[-1].split(",")
+            prev = lines[-2].split(",")
+            if len(last) < 5 or len(prev) < 5:
+                log.warning(f"[stooq] CSV missing fields last={last!r} prev={prev!r}")
+                return None
+            last_close = float(last[4])
+            prev_close = float(prev[4])
+            chg = ((last_close - prev_close) / prev_close) * 100.0
+            log.info("[stooq] OK")
+            return last_close, chg
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning(f"[stooq] error: {e}")
+        return None
+
+async def fetch_price_change(session: aiohttp.ClientSession) -> Tuple[float, float, str]:
+    """
+    Try Yahoo quote -> Yahoo chart -> Stooq fallback.
+    Returns (price, change_pct, source).
+    """
+    # jitter between cycles so multiple bots don't sync-hammer Yahoo
+    await asyncio.sleep(random.uniform(0.0, 0.8))
+
+    q = await yahoo_quote(session)
     if q is not None:
-        return q
-    c = await _yahoo_chart(session)
+        return q[0], q[1], "yahoo-quote"
+
+    c = await yahoo_chart(session)
     if c is not None:
-        return c
-    raise RuntimeError("Both Yahoo quote and chart failed")
+        return c[0], c[1], "yahoo-chart"
+
+    s = await stooq_fut_last_and_change(session)
+    if s is not None:
+        return s[0], s[1], "stooq"
+
+    raise RuntimeError("All sources failed (quote, chart, stooq)")
 
 # ---------- Discord helpers ----------
 async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
-    """Robustly get the bot's Member object in a guild."""
     me = getattr(guild, "me", None)
     if isinstance(me, discord.Member):
         return me
@@ -162,7 +198,6 @@ async def get_self_member(guild: discord.Guild) -> Optional[discord.Member]:
         return None
 
 async def update_guild(guild: discord.Guild):
-    """Update nickname/presence for a single guild to show NASDAQ futures."""
     me = await get_self_member(guild)
     if not me:
         log.info(f"[{guild.name}] Could not obtain bot Member; skipping.")
@@ -173,7 +208,7 @@ async def update_guild(guild: discord.Guild):
 
     try:
         assert _http_session is not None, "HTTP session not initialized"
-        price, change_pct = await fetch_nq_price_change(_http_session)
+        price, change_pct, source = await fetch_price_change(_http_session)
     except Exception as e:
         log.error(f"[{guild.name}] Quote fetch failed: {e}")
         try:
@@ -189,7 +224,7 @@ async def update_guild(guild: discord.Guild):
 
     if can_edit_nick:
         try:
-            await me.edit(nick=nickname, reason="Auto NASDAQ futures price update (Yahoo)")
+            await me.edit(nick=nickname, reason=f"Auto NASDAQ futures update ({source})")
         except discord.Forbidden:
             log.info(f"[{guild.name}] Forbidden by role hierarchy; cannot change nickname.")
         except discord.HTTPException as e:
@@ -202,7 +237,7 @@ async def update_guild(guild: discord.Guild):
     except Exception as e:
         log.debug(f"[{guild.name}] Could not set presence: {e}")
 
-    log.info(f"[{guild.name}] NASDAQ Futures → Nick: {nickname if can_edit_nick else '(unchanged)'} "
+    log.info(f"[{guild.name}] NASDAQ Futures [{source}] → Nick: {nickname if can_edit_nick else '(unchanged)'} "
              f"| 1D {change_pct:+.2f}%")
 
 # ---------- Loop ----------
@@ -231,7 +266,10 @@ async def updater_loop():
                 await asyncio.gather(*(update_guild(g) for g in targets))
         except Exception as e:
             log.error(f"Updater loop error: {e}")
-        await asyncio.sleep(INTERVAL_SECONDS)
+
+        # add a small random jitter to spread requests
+        sleep_for = INTERVAL_SECONDS + random.uniform(0.0, 2.0)
+        await asyncio.sleep(sleep_for)
 
 @client.event
 async def on_ready():
